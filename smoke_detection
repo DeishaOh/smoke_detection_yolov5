@@ -1,0 +1,240 @@
+'''
+- roboflow에서 데이터를 다운받아 모델 그대로 돌리기만 하면 여러 detection 모델을 만들 수 있다
+- 코랩에서 12g밖에 못써서 epoch을 100까지밖에 주지 못했다. gpu 성능만 따라오면 훨씬 더 높은 성능의 모델 생성 가능
+- roboflow에선 객체가 2개인 이미지를 사용했다. 데이터 마다 다르지만 현재 연기 데이터는 737장 뿐이다
+'''
+
+# yolov5 깃허브 : https://github.com/ultralytics/yolov5
+
+
+%cd /content
+!git clone https://github.com/ultralytics/yolov5
+%cd yolov5
+!pip install -qr requirements.txt
+
+import torch
+from IPython.display import Image, clear_output
+
+#----------------------------------------------------------------------------------------------------------- 클론 상태 및 모델 확인
+!ls data/images # bus.jpg  zidane.jpg
+!python detect.py --weights yolov5s.pt --img 640 --conf 0.25 --source data/images/
+Image(filename='runs/detect/exp/bus.jpg', width = 600)
+Image(filename='runs/detect/exp/zidane.jpg', width = 600)
+
+# 연기 데이터셋 다운로드 : https://public.roboflow.com/object-detection/wildfire-smoke/
+# -----------------------------------------------------------------------------------------------------------폴더링
+%mkdir /content/yolov5/smoke
+%cd /content/yolov5/smoke
+
+!curl -L "https://public.roboflow.com/ds/DbR39Bi81I?key=A51iFKK2Ms" > roboflow.zip; unzip roboflow.zip; rm roboflow.zip
+
+#----------------------------------------------------------------------------------------------------------- train - test - valid
+from glob import glob
+
+train_img_list = glob('/content/yolov5/smoke/train/images/*.jpg')
+test_img_list = glob('/content/yolov5/smoke/test/images/*.jpg')
+valid_img_list = glob('/content/yolov5/smoke/valid/images/*.jpg')
+#------------------------------------------------------------------------------------------------------------ 데이터 확인
+print(len(train_img_list), len(test_img_list), len(valid_img_list))
+
+#------------------------------------------------------------------------------------------------------------ 데이터 직렬화
+import yaml
+
+with open('/content/yolov5/smoke/train.txt', 'w') as f:
+  f.write('\n'.join(train_img_list) + '\n')
+
+with open('/content/yolov5/smoke/test.txt', 'w') as f:
+  f.write('\n'.join(test_img_list) + '\n')
+
+with open('/content/yolov5/smoke/valid.txt', 'w') as f:
+  f.write('\n'.join(valid_img_list) + '\n')
+  
+# -----------------------------------------------------------------------------------------------------------템플릿 확인
+%cat /content/yolov5/smoke/data.yaml
+'''
+train: ../train/images
+val: ../valid/images
+
+nc: 1
+names: ['smoke']
+'''
+
+#---------------------------------------------------------------------------------------------------------- 템플릿 새로 쓰기
+# train-test-val 로 나누었으므로 test 추가
+%%writetemplate /content/yolov5/smoke/data.yaml
+
+train : /smoke/train/images
+test : /smoke/test/images 
+val : /smoke/valid/images
+
+nc: 1
+names: ['smoke']
+
+# ------------------------------------------------------------------------------------------------------------- 적용 확인
+%cat /content/yolov5/smoke/data.yaml
+
+# ------------------------------------------------------------------------------------------------------------모델 구성
+with open('/content/yolov5/smoke/data.yaml', 'r') as stream:
+  num_classes = str(yaml.safe_load(stream)['nc'])
+
+%cat /content/yolov5/models/yolov5s.yaml
+'''
+# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
+
+# Parameters
+nc: 80  # number of classes
+depth_multiple: 0.33  # model depth multiple
+width_multiple: 0.50  # layer channel multiple
+anchors:
+  - [10,13, 16,30, 33,23]  # P3/8
+  - [30,61, 62,45, 59,119]  # P4/16
+  - [116,90, 156,198, 373,326]  # P5/32
+
+# YOLOv5 v6.0 backbone
+backbone:
+  # [from, number, module, args]
+  [[-1, 1, Conv, [64, 6, 2, 2]],  # 0-P1/2
+   [-1, 1, Conv, [128, 3, 2]],  # 1-P2/4
+   [-1, 3, C3, [128]],
+   [-1, 1, Conv, [256, 3, 2]],  # 3-P3/8
+   [-1, 6, C3, [256]],
+   [-1, 1, Conv, [512, 3, 2]],  # 5-P4/16
+   [-1, 9, C3, [512]],
+   [-1, 1, Conv, [1024, 3, 2]],  # 7-P5/32
+   [-1, 3, C3, [1024]],
+   [-1, 1, SPPF, [1024, 5]],  # 9
+  ]
+
+# YOLOv5 v6.0 head
+head:
+  [[-1, 1, Conv, [512, 1, 1]],
+   [-1, 1, nn.Upsample, [None, 2, 'nearest']],
+   [[-1, 6], 1, Concat, [1]],  # cat backbone P4
+   [-1, 3, C3, [512, False]],  # 13
+
+   [-1, 1, Conv, [256, 1, 1]],
+   [-1, 1, nn.Upsample, [None, 2, 'nearest']],
+   [[-1, 4], 1, Concat, [1]],  # cat backbone P3
+   [-1, 3, C3, [256, False]],  # 17 (P3/8-small)
+
+   [-1, 1, Conv, [256, 3, 2]],
+   [[-1, 14], 1, Concat, [1]],  # cat head P4
+   [-1, 3, C3, [512, False]],  # 20 (P4/16-medium)
+
+   [-1, 1, Conv, [512, 3, 2]],
+   [[-1, 10], 1, Concat, [1]],  # cat head P5
+   [-1, 3, C3, [1024, False]],  # 23 (P5/32-large)
+
+   [[17, 20, 23], 1, Detect, [nc, anchors]],  # Detect(P3, P4, P5)
+  ]
+'''
+
+#---------------------------------------------------------------------------------------- ox 를 골라내는 작업이므로 nc를 바꿔서 재작성
+%%writetemplate /content/yolov5/models/custom_yolov5s.yaml
+
+# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
+
+# Parameters
+nc: {num_classes}  # number of classes
+depth_multiple: 0.33  # model depth multiple
+width_multiple: 0.50  # layer channel multiple
+anchors:
+  - [10,13, 16,30, 33,23]  # P3/8
+  - [30,61, 62,45, 59,119]  # P4/16
+  - [116,90, 156,198, 373,326]  # P5/32
+
+# YOLOv5 v6.0 backbone
+backbone:
+  # [from, number, module, args]
+  [[-1, 1, Conv, [64, 6, 2, 2]],  # 0-P1/2
+   [-1, 1, Conv, [128, 3, 2]],  # 1-P2/4
+   [-1, 3, C3, [128]],
+   [-1, 1, Conv, [256, 3, 2]],  # 3-P3/8
+   [-1, 6, C3, [256]],
+   [-1, 1, Conv, [512, 3, 2]],  # 5-P4/16
+   [-1, 9, C3, [512]],
+   [-1, 1, Conv, [1024, 3, 2]],  # 7-P5/32
+   [-1, 3, C3, [1024]],
+   [-1, 1, SPPF, [1024, 5]],  # 9
+  ]
+
+# YOLOv5 v6.0 head
+head:
+  [[-1, 1, Conv, [512, 1, 1]],
+   [-1, 1, nn.Upsample, [None, 2, 'nearest']],
+   [[-1, 6], 1, Concat, [1]],  # cat backbone P4
+   [-1, 3, C3, [512, False]],  # 13
+
+   [-1, 1, Conv, [256, 1, 1]],
+   [-1, 1, nn.Upsample, [None, 2, 'nearest']],
+   [[-1, 4], 1, Concat, [1]],  # cat backbone P3
+   [-1, 3, C3, [256, False]],  # 17 (P3/8-small)
+
+   [-1, 1, Conv, [256, 3, 2]],
+   [[-1, 14], 1, Concat, [1]],  # cat head P4
+   [-1, 3, C3, [512, False]],  # 20 (P4/16-medium)
+
+   [-1, 1, Conv, [512, 3, 2]],
+   [[-1, 10], 1, Concat, [1]],  # cat head P5
+   [-1, 3, C3, [1024, False]],  # 23 (P5/32-large)
+
+   [[17, 20, 23], 1, Detect, [nc, anchors]],  # Detect(P3, P4, P5)
+  ]
+  
+#--------------------------------------------------------------------------------------------------------- 적용 상태 확인
+%cat /content/yolov5/models/custom_yolov5s.yaml
+
+#--------------------------------------------------------------------------------------------------------- 학습
+'''
+- img: 입력 이미지 크기 정의
+- batch: 배치 크기 결정
+- epochs: 학습 기간 개수 정의
+- data: yaml 파일 경로
+- cfg: 모델 구성 지정
+- weights: 가중치에 대한 경로 지정
+- name: 결과 이름
+- nosave: 최종 체크포인트만 저장
+- cache: 빠른 학습을 위한 이미지 캐시
+'''
+%%time
+%cd /content/yolov5
+!python train.py --img 640 --batch 32 --epochs 100 --data ./pothole/data.yaml --cfg ./models/custom_yolov5s.yaml --weights '' --name smoke_results --cache
+
+#------------------------------------------------------------------------------------------------------------ tensor board 시각화
+%load_ext tensorboard
+%tensorboard --logdir runs
+
+#------------------------------------------------------------------------------------------------------------ 학습 파일 생성 확인
+!ls runs/train/smoke_results52
+
+#---------------------------------------------------------------------------------------------------------------- 결과 확인
+Image(filename = 'runs/train/smoke_results/results.png', width = 1000)
+Image(filename = 'runs/train/smoke_results/train_batch0.jpg', width = 1000)
+Image(filename = 'runs/train/smoke_results52/val_batch0_labels.jpg', width = 1000)
+
+#------------------------------------------------------------------------------------------------------------------ 검증
+!python detect.py --weights runs/train/smoke_results/weights/best.pt --img 640 --conf 0.4 --source ./smoke/test/images
+!python val.py --weights runs/train/pothole_results/weights/best.pt --data ./smoke/data.yaml --img 640 --task test
+
+#------------------------------------------------------------------------------------------------------------------- 추론
+# 모델 생성 상태 확인
+%ls runs/train/smoke_results/weights
+!python detect.py --weights runs/train/smoke_results/weights/best.pt --img 640 --conf 0.4 --source ./smoke/test/images
+
+# random을 통해 실행할 때 마다 다른 사진의 결과를 보여줌
+import glob
+import random
+from IPython.display import Image, display
+
+# 알맞은 경로 잘 찾기
+image_name = random.choice(glob.glob('/content/yolov5/runs/detect/exp2/*.jpg'))
+display(Image(filename=image_name))
+
+#------------------------------------------------------------------------------------------------------------------ 모델 저장
+# google drive mount
+from google.colab import drive
+drive.mount('/content/drive')
+
+# 폴더링 및 모델 저장
+%mkdir /content/drive/My\ Drive/pothole
+%cp /content/yolov5/runs/train/pothole_results/weights/best.pt /content/drive/My\ Drive/pothole
